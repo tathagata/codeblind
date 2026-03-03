@@ -1,3 +1,4 @@
 pytest
 SpeechRecognition
 anthropic
+pyperclip
