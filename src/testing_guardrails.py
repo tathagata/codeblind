@@ -25,6 +25,10 @@ class TestingGuardrails:
             "stderr": result.stderr,
         }
 
+    def verify_workspace(self, test_paths=None):
+        """Run the repository test suite and return the raw pytest result."""
+        return self.run_tests(test_paths=test_paths or ["tests/"])
+
     def parse_results(self, run_result):
         """Parse pytest output to extract passed/failed counts."""
         stdout = run_result.get("stdout", "")

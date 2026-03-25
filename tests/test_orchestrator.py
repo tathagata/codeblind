@@ -1,8 +1,8 @@
-import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from orchestrator import Orchestrator, OrchestratorError, TTSBridge, TTSError
+from harness_types import ProposedAction
+from orchestrator import Orchestrator, TTSBridge, TTSError
 
 
 class TestTTSBridgeSpeak:
@@ -22,7 +22,6 @@ class TestTTSBridgeSpeak:
             bridge.speak("Hello")
 
     def test_speak_calls_subprocess_with_text(self, tmp_path):
-        # Create a fake executable file so the path check passes
         fake_exe = tmp_path / "tts"
         fake_exe.write_text("#!/bin/sh\nexit 0\n")
         fake_exe.chmod(0o755)
@@ -55,7 +54,7 @@ class TestTTSBridgeSpeak:
         assert "swift_tts" in bridge._executable
 
 
-class TestOrchestrator:
+class TestLegacyOrchestratorBehavior:
     def _make_orchestrator(self, command="write a sort function", code="def sort(): pass",
                            summary="passed all 1 tests"):
         voice_parser = MagicMock()
@@ -78,27 +77,6 @@ class TestOrchestrator:
         result = orchestrator.run_once()
         assert set(result.keys()) == {"command", "code", "summary"}
 
-    def test_run_once_returns_correct_values(self):
-        orchestrator, _, _, _, _ = self._make_orchestrator(
-            command="create a sort function",
-            code="def sort(): pass",
-            summary="passed all 1 tests",
-        )
-        result = orchestrator.run_once()
-        assert result["command"] == "create a sort function"
-        assert result["code"] == "def sort(): pass"
-        assert result["summary"] == "passed all 1 tests"
-
-    def test_run_once_calls_voice_parser(self):
-        orchestrator, voice_parser, _, _, _ = self._make_orchestrator()
-        orchestrator.run_once()
-        voice_parser.speech_to_text.assert_called_once()
-
-    def test_run_once_calls_claude_api_with_command(self):
-        orchestrator, _, claude_api, _, _ = self._make_orchestrator(command="my command")
-        orchestrator.run_once()
-        claude_api.generate_code.assert_called_once_with("my command")
-
     def test_run_once_calls_testing_guardrails_with_code(self):
         orchestrator, _, _, testing_guardrails, _ = self._make_orchestrator(
             code="def foo(): return 1"
@@ -106,25 +84,108 @@ class TestOrchestrator:
         orchestrator.run_once()
         testing_guardrails.validate_code.assert_called_once_with("def foo(): return 1")
 
-    def test_run_once_calls_tts_bridge_with_summary(self):
-        orchestrator, _, _, _, tts_bridge = self._make_orchestrator(
-            summary="Your code passed all 3 tests."
+    def test_run_pipeline_returns_expected_keys(self):
+        orchestrator, _, _, _, _ = self._make_orchestrator()
+        result = orchestrator.run_pipeline()
+        assert set(result.keys()) == {"command", "response"}
+
+
+class TestSessionOrchestrator:
+    def _make_session_orchestrator(self):
+        voice_parser = MagicMock()
+
+        claude_api = MagicMock()
+        claude_api.answer_question.return_value = "The working tree has two modified files."
+        claude_api.summarize_execution.return_value = "Updated main.py and ran the tests."
+        claude_api.plan_code_change.return_value = {
+            "action_type": "edit_file",
+            "target_paths": ["main.py"],
+            "content": "print('updated')\n",
+            "summary": "update main.py",
+            "rollback_note": "Restore the previous version from git diff.",
+            "verification_command": ["python", "-m", "pytest", "tests/test_orchestrator.py"],
+        }
+
+        testing_guardrails = MagicMock()
+
+        repo_operations = MagicMock()
+        repo_operations.git_status.return_value = " M main.py"
+        repo_operations.describe_workspace.return_value = "Repo root: /tmp/repo"
+        repo_operations.read_file.return_value = "print('hello')"
+        repo_operations.search_files.return_value = "main.py:10:def main():"
+        repo_operations.summarize_tests.return_value = "Your code passed all 5 tests."
+
+        def apply_action(action):
+            if action.action_type == "edit_file":
+                return ["Updated main.py."]
+            if action.action_type == "run_command":
+                return ["Ran python -m pytest tests/test_orchestrator.py.", "1 passed in 0.01s"]
+            raise AssertionError(f"Unexpected action type {action.action_type}")
+
+        repo_operations.apply_action.side_effect = apply_action
+
+        tts_bridge = MagicMock()
+        orchestrator = Orchestrator(
+            voice_parser=voice_parser,
+            claude_api=claude_api,
+            testing_guardrails=testing_guardrails,
+            tts_bridge=tts_bridge,
+            repo_operations=repo_operations,
         )
-        orchestrator.run_once()
-        tts_bridge.speak.assert_called_once_with("Your code passed all 3 tests.")
+        return orchestrator, claude_api, repo_operations, tts_bridge
 
-    def test_run_once_propagates_voice_parser_error(self):
-        from voice_parser import VoiceParserError
+    def test_start_session_speaks_greeting(self):
+        orchestrator, _, _, tts_bridge = self._make_session_orchestrator()
+        greeting = orchestrator.start_session()
+        assert "CodeBlind session ready" in greeting
+        tts_bridge.speak.assert_called_once()
 
-        orchestrator, voice_parser, _, _, _ = self._make_orchestrator()
-        voice_parser.speech_to_text.side_effect = VoiceParserError("mic error")
-        with pytest.raises(VoiceParserError, match="mic error"):
-            orchestrator.run_once()
+    def test_exploration_request_runs_immediately(self):
+        orchestrator, claude_api, repo_operations, _ = self._make_session_orchestrator()
+        result = orchestrator.handle_turn("git status")
+        assert result.intent == "explore"
+        assert result.pending_approval_request is None
+        assert result.actions_taken == [" M main.py"]
+        repo_operations.git_status.assert_called_once()
+        claude_api.answer_question.assert_called_once()
 
-    def test_run_once_propagates_claude_api_error(self):
-        from claude_api import ClaudeAPIError
+    def test_code_change_request_requires_approval(self):
+        orchestrator, claude_api, repo_operations, _ = self._make_session_orchestrator()
+        result = orchestrator.handle_turn("update main.py to start a session")
+        assert result.intent == "code_change"
+        assert isinstance(result.pending_approval_request, ProposedAction)
+        assert result.pending_approval_request.target_paths == ["main.py"]
+        repo_operations.apply_action.assert_not_called()
+        claude_api.plan_code_change.assert_called_once()
 
-        orchestrator, _, claude_api, _, _ = self._make_orchestrator()
-        claude_api.generate_code.side_effect = ClaudeAPIError("API down")
-        with pytest.raises(ClaudeAPIError, match="API down"):
-            orchestrator.run_once()
+    def test_approve_runs_pending_action_and_verification(self):
+        orchestrator, _, repo_operations, _ = self._make_session_orchestrator()
+        orchestrator.handle_turn("update main.py to start a session")
+        result = orchestrator.handle_turn("approve")
+        assert result.intent == "approval"
+        assert "Updated main.py." in result.actions_taken
+        assert result.verification_summary is not None
+        assert repo_operations.apply_action.call_count == 2
+
+    def test_cancel_clears_pending_action(self):
+        orchestrator, _, repo_operations, _ = self._make_session_orchestrator()
+        orchestrator.handle_turn("update main.py to start a session")
+        result = orchestrator.handle_turn("cancel")
+        assert result.intent == "cancel"
+        assert "Canceled the pending action" in result.spoken_response
+        repo_operations.apply_action.assert_not_called()
+
+    def test_explain_uses_latest_task_state(self):
+        orchestrator, _, _, _ = self._make_session_orchestrator()
+        orchestrator.handle_turn("update main.py to start a session")
+        orchestrator.handle_turn("approve")
+        result = orchestrator.handle_turn("explain what changed")
+        assert result.intent == "explain"
+        assert "Updated main.py" in result.spoken_response or "updated" in result.spoken_response.lower()
+
+    def test_run_tests_request_returns_verification_summary(self):
+        orchestrator, _, repo_operations, _ = self._make_session_orchestrator()
+        result = orchestrator.handle_turn("run tests")
+        assert result.intent == "test"
+        assert result.verification_summary == "Your code passed all 5 tests."
+        repo_operations.summarize_tests.assert_called_once()

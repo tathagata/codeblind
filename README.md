@@ -2,18 +2,18 @@
 
 > When I say nocode, I really mean it.
 
-CodeBlind is a voice-driven code generation tool. Speak a programming task aloud; the app captures your voice, sends it to the Claude API to generate code, validates the result with pytest, and reads the outcome back to you via text-to-speech.
+CodeBlind is a voice-first local coding harness. Speak a repo task aloud; the app captures your voice, inspects the workspace, plans or answers the request, and reads the result back to you via text-to-speech. Mutating actions are confirmation-gated, so the harness can explore freely but will ask before editing files or running risky commands.
 
 ## How It Works
 
 ```
-Microphone → VoiceParser → ClaudeAPI → TestingGuardrails → TTSBridge (spoken output)
+Microphone → VoiceParser → Session Orchestrator → Repo Ops / ClaudeAPI → TTSBridge
 ```
 
 1. **VoiceParser** – captures audio from your microphone and transcribes it to text.
-2. **ClaudeAPI** – sends the transcribed text to the Claude API (default model: Claude 3.5 Sonnet, configurable) and returns generated code.
-3. **TestingGuardrails** – runs `pytest` against the generated code and summarises the results.
-4. **TTSBridge** – pipes the summary to the Swift TTS executable for spoken output (macOS only; optional on other platforms).
+2. **Session Orchestrator** – keeps turn history, classifies intent, and decides whether to answer immediately or stage a proposed repo action.
+3. **Repo Ops / ClaudeAPI** – either inspects the repo and answers questions, runs verification, or drafts a code change proposal that waits for spoken approval.
+4. **TTSBridge** – pipes the response to the Swift TTS executable for spoken output (macOS only; optional on other platforms).
 
 ---
 
@@ -88,35 +88,30 @@ The compiled binary will be placed at `swift_tts/.build/release/swift_tts`. The 
 
 ## Running the Application
 
-### Quick start (interactive loop)
-
-```python
-# run_codeblind.py  (create this file in the project root, or run in a Python REPL)
-import os
-from src.claude_api import ClaudeAPI
-from src.voice_parser import VoiceParser
-from src.testing_guardrails import TestingGuardrails
-from src.orchestrator import Orchestrator, TTSBridge
-
-voice   = VoiceParser()
-claude  = ClaudeAPI(api_key=os.environ["ANTHROPIC_API_KEY"])
-guards  = TestingGuardrails()
-tts     = TTSBridge()          # remove / mock on non-macOS systems
-
-orchestrator = Orchestrator(voice, claude, guards, tts)
-
-result = orchestrator.run_once()
-print("Command :", result["command"])
-print("Summary :", result["summary"])
-```
-
-Run it with:
+### Session mode (default)
 
 ```bash
-python run_codeblind.py
+python main.py
+python main.py --voice handy
+python main.py --once
 ```
 
-Speak your programming task when prompted (e.g. *"write a function that reverses a string"*). The tool will generate the code, run tests, and read the outcome aloud.
+Speak repo-aware requests such as:
+- “git status”
+- “search for `TestingGuardrails`”
+- “run tests”
+- “update `main.py` to use the session controller”
+
+For mutating requests, CodeBlind will propose an action and wait for a spoken confirmation like “approve” or “cancel”.
+
+### Direct mode (legacy)
+
+```bash
+python main.py --direct
+python main.py --direct --once
+```
+
+This preserves the earlier voice → Claude → TTS path without conversational state or confirmation gating.
 
 ### Alternative: Handy (offline voice input, macOS)
 
@@ -146,7 +141,9 @@ All tests use mocks for external dependencies (microphone, Claude API, TTS), so 
 codeblind/
 ├── src/
 │   ├── claude_api.py          # Claude API integration
+│   ├── harness_types.py       # ProposedAction and TurnResult models
 │   ├── orchestrator.py        # Pipeline orchestration and TTSBridge
+│   ├── repo_ops.py            # Repo inspection, test runs, and approved mutations
 │   ├── testing_guardrails.py  # pytest-based code validation
 │   ├── voice_parser.py        # VoiceParser and HandyVoiceParser
 │   └── vscode_integration.py  # Open generated files in VS Code
